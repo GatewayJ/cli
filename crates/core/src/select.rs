@@ -1,5 +1,7 @@
 //! S3 Select domain types (no AWS SDK types).
 
+use crate::{Error, Result};
+
 /// Object payload format for S3 Select input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SelectInputFormat {
@@ -114,6 +116,99 @@ pub struct SelectOptions {
     pub sse_customer: SelectSseCustomerOptions,
 }
 
+impl SelectCsvInputOptions {
+    pub fn validate(&self) -> Result<()> {
+        validate_single_byte("CSV input field delimiter", self.field_delimiter.as_deref())?;
+        validate_single_byte("CSV input quote character", self.quote_character.as_deref())?;
+        validate_single_byte(
+            "CSV input quote escape character",
+            self.quote_escape_character.as_deref(),
+        )?;
+        validate_single_byte("CSV input comment character", self.comments.as_deref())?;
+
+        Ok(())
+    }
+}
+
+impl SelectCsvOutputOptions {
+    pub fn validate(&self) -> Result<()> {
+        validate_single_byte(
+            "CSV output field delimiter",
+            self.field_delimiter.as_deref(),
+        )?;
+        validate_record_delimiter(
+            "CSV output record delimiter",
+            self.record_delimiter.as_deref(),
+        )?;
+        validate_single_byte(
+            "CSV output quote character",
+            self.quote_character.as_deref(),
+        )?;
+        validate_single_byte(
+            "CSV output quote escape character",
+            self.quote_escape_character.as_deref(),
+        )?;
+
+        Ok(())
+    }
+}
+
+impl SelectOptions {
+    pub fn validate(&self) -> Result<()> {
+        self.csv_input.validate()?;
+        self.csv_output.validate()?;
+        self.validate_scan_range()?;
+
+        Ok(())
+    }
+
+    pub fn validate_scan_range(&self) -> Result<()> {
+        let scan_range = &self.scan_range;
+        if scan_range.start.is_none() && scan_range.end.is_none() {
+            return Ok(());
+        }
+
+        if matches!(self.input_format, SelectInputFormat::Parquet) {
+            return Err(Error::General(
+                "ScanRange is not supported for Parquet input.".to_string(),
+            ));
+        }
+        if matches!(self.input_format, SelectInputFormat::Json)
+            && matches!(self.json_input.input_type, SelectJsonInputType::Document)
+        {
+            return Err(Error::General(
+                "ScanRange is not supported for JSON document input.".to_string(),
+            ));
+        }
+        if !matches!(self.compression, SelectCompression::None)
+            && matches!(
+                self.input_format,
+                SelectInputFormat::Csv | SelectInputFormat::Json
+            )
+        {
+            return Err(Error::General(
+                "ScanRange is only supported for uncompressed CSV/JSON input.".to_string(),
+            ));
+        }
+        if scan_range.start.is_some_and(|start| start < 0)
+            || scan_range.end.is_some_and(|end| end < 0)
+        {
+            return Err(Error::General(
+                "ScanRange start and end must be non-negative.".to_string(),
+            ));
+        }
+        if let (Some(start), Some(end)) = (scan_range.start, scan_range.end)
+            && start > end
+        {
+            return Err(Error::General(
+                "ScanRange start must not be greater than end.".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+}
+
 impl Default for SelectOptions {
     fn default() -> Self {
         Self {
@@ -129,4 +224,25 @@ impl Default for SelectOptions {
             sse_customer: SelectSseCustomerOptions::default(),
         }
     }
+}
+
+fn validate_single_byte(name: &str, value: Option<&str>) -> Result<()> {
+    if let Some(value) = value
+        && value.len() != 1
+    {
+        return Err(Error::General(format!("{name} must be exactly one byte.")));
+    }
+    Ok(())
+}
+
+fn validate_record_delimiter(name: &str, value: Option<&str>) -> Result<()> {
+    if let Some(value) = value
+        && value.len() != 1
+        && value != "\r\n"
+    {
+        return Err(Error::General(format!(
+            "{name} must be exactly one byte or CRLF."
+        )));
+    }
+    Ok(())
 }

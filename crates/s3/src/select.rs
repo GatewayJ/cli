@@ -23,6 +23,8 @@ pub async fn select_object_content(
     options: &SelectOptions,
     writer: &mut (dyn AsyncWrite + Send + Unpin),
 ) -> Result<()> {
+    options.validate()?;
+
     let input = build_input_serialization(options)?;
     let output = build_output_serialization(options)?;
 
@@ -97,34 +99,11 @@ fn quote_fields(quote_fields: RcSelectQuoteFields) -> QuoteFields {
 }
 
 fn build_scan_range(options: &SelectOptions) -> Result<Option<ScanRange>> {
+    options.validate_scan_range()?;
+
     let scan_range = &options.scan_range;
     if scan_range.start.is_none() && scan_range.end.is_none() {
         return Ok(None);
-    }
-    if matches!(options.input_format, SelectInputFormat::Parquet) {
-        return Err(Error::General(
-            "ScanRange is not supported for Parquet input.".to_string(),
-        ));
-    }
-    if matches!(options.input_format, SelectInputFormat::Json)
-        && matches!(options.json_input.input_type, SelectJsonInputType::Document)
-    {
-        return Err(Error::General(
-            "ScanRange is not supported for JSON document input.".to_string(),
-        ));
-    }
-    if scan_range.start.is_some_and(|start| start < 0) || scan_range.end.is_some_and(|end| end < 0)
-    {
-        return Err(Error::General(
-            "ScanRange start and end must be non-negative.".to_string(),
-        ));
-    }
-    if let (Some(start), Some(end)) = (scan_range.start, scan_range.end)
-        && start > end
-    {
-        return Err(Error::General(
-            "ScanRange start must not be greater than end.".to_string(),
-        ));
     }
     Ok(Some(
         ScanRange::builder()
@@ -132,27 +111,6 @@ fn build_scan_range(options: &SelectOptions) -> Result<Option<ScanRange>> {
             .set_end(scan_range.end)
             .build(),
     ))
-}
-
-fn validate_single_byte(name: &str, value: Option<&str>) -> Result<()> {
-    if let Some(value) = value
-        && value.len() != 1
-    {
-        return Err(Error::General(format!("{name} must be exactly one byte.")));
-    }
-    Ok(())
-}
-
-fn validate_record_delimiter(name: &str, value: Option<&str>) -> Result<()> {
-    if let Some(value) = value
-        && value.len() != 1
-        && value != "\r\n"
-    {
-        return Err(Error::General(format!(
-            "{name} must be exactly one byte or CRLF."
-        )));
-    }
-    Ok(())
 }
 
 fn build_input_serialization(options: &SelectOptions) -> Result<InputSerialization> {
@@ -168,22 +126,7 @@ fn build_input_serialization(options: &SelectOptions) -> Result<InputSerializati
     let mut b = InputSerialization::builder().compression_type(compression);
     match options.input_format {
         SelectInputFormat::Csv => {
-            validate_single_byte(
-                "CSV input field delimiter",
-                options.csv_input.field_delimiter.as_deref(),
-            )?;
-            validate_single_byte(
-                "CSV input quote character",
-                options.csv_input.quote_character.as_deref(),
-            )?;
-            validate_single_byte(
-                "CSV input quote escape character",
-                options.csv_input.quote_escape_character.as_deref(),
-            )?;
-            validate_single_byte(
-                "CSV input comment character",
-                options.csv_input.comments.as_deref(),
-            )?;
+            options.csv_input.validate()?;
             let mut csv = CsvInput::builder()
                 .file_header_info(csv_file_header_info(options.csv_input.file_header_info));
             if let Some(delimiter) = options.csv_input.field_delimiter.as_deref() {
@@ -219,22 +162,7 @@ fn build_output_serialization(options: &SelectOptions) -> Result<OutputSerializa
     let mut b = OutputSerialization::builder();
     match options.output_format {
         SelectOutputFormat::Csv => {
-            validate_single_byte(
-                "CSV output field delimiter",
-                options.csv_output.field_delimiter.as_deref(),
-            )?;
-            validate_record_delimiter(
-                "CSV output record delimiter",
-                options.csv_output.record_delimiter.as_deref(),
-            )?;
-            validate_single_byte(
-                "CSV output quote character",
-                options.csv_output.quote_character.as_deref(),
-            )?;
-            validate_single_byte(
-                "CSV output quote escape character",
-                options.csv_output.quote_escape_character.as_deref(),
-            )?;
+            options.csv_output.validate()?;
             let mut csv =
                 CsvOutput::builder().quote_fields(quote_fields(options.csv_output.quote_fields));
             if let Some(delimiter) = options.csv_output.field_delimiter.as_deref() {
@@ -627,5 +555,41 @@ mod tests {
 
         let error = build_scan_range(&options).expect_err("start after end should be rejected");
         assert!(matches!(error, Error::General(msg) if msg.contains("greater than end")));
+    }
+
+    #[test]
+    fn scan_range_rejects_compressed_csv() {
+        let options = SelectOptions {
+            expression: "SELECT * FROM S3Object".to_string(),
+            input_format: SelectInputFormat::Csv,
+            compression: SelectCompression::Gzip,
+            scan_range: SelectScanRangeOptions {
+                start: Some(0),
+                end: None,
+            },
+            ..SelectOptions::default()
+        };
+
+        let error =
+            build_scan_range(&options).expect_err("scan range should reject compressed CSV input");
+        assert!(matches!(error, Error::General(msg) if msg.contains("uncompressed CSV/JSON")));
+    }
+
+    #[test]
+    fn scan_range_rejects_compressed_json() {
+        let options = SelectOptions {
+            expression: "SELECT * FROM S3Object".to_string(),
+            input_format: SelectInputFormat::Json,
+            compression: SelectCompression::Gzip,
+            scan_range: SelectScanRangeOptions {
+                start: Some(0),
+                end: None,
+            },
+            ..SelectOptions::default()
+        };
+
+        let error =
+            build_scan_range(&options).expect_err("scan range should reject compressed JSON input");
+        assert!(matches!(error, Error::General(msg) if msg.contains("uncompressed CSV/JSON")));
     }
 }
